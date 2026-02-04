@@ -25,6 +25,7 @@ module Dodo
         @input_point = Sketchup::InputPoint.new
         @input_point2 = Sketchup::InputPoint.new
         @cursor_point = nil
+        @soft_edge_segments = [] # Track which profile segments are soft
       end
 
       def activate
@@ -238,7 +239,10 @@ module Dodo
 
           # Create a new group for the result
           result_group = model.active_entities.add_group
-          result_group.entities.fill_from_mesh(mesh, true, Geom::PolygonMesh::AUTO_SOFTEN)
+          result_group.entities.fill_from_mesh(mesh, true, Geom::PolygonMesh::NO_SMOOTH_OR_HIDE)
+
+          # Apply smart softening
+          apply_smart_softening(result_group, axis_point, axis_vector)
 
           # Copy materials if available
           copy_materials(@profile_group, result_group)
@@ -263,16 +267,38 @@ module Dodo
 
       def collect_profile_edges(group)
         edges = []
+        @soft_edge_map = {} # Maps edge segment key to soft status
+        transform = group.transformation
+
         group.entities.each do |entity|
           if entity.is_a?(Sketchup::Edge)
             edges << entity
+            record_edge_softness(entity, transform)
           elsif entity.is_a?(Sketchup::Face)
             entity.edges.each do |edge|
-              edges << edge unless edges.include?(edge)
+              unless edges.include?(edge)
+                edges << edge
+                record_edge_softness(edge, transform)
+              end
             end
           end
         end
         edges.uniq
+      end
+
+      def record_edge_softness(edge, transform)
+        # Record whether this edge is soft/smooth in the original profile
+        p1 = edge.start.position.transform(transform)
+        p2 = edge.end.position.transform(transform)
+        key = edge_segment_key(p1, p2)
+        @soft_edge_map[key] = edge.soft? || edge.smooth?
+      end
+
+      def edge_segment_key(p1, p2)
+        # Create a consistent key for an edge segment (order-independent)
+        k1 = point_key(p1)
+        k2 = point_key(p2)
+        [k1, k2].sort.join('|')
       end
 
       # Collect all edge chains from the profile (handles multiple disconnected chains)
@@ -453,22 +479,31 @@ module Dodo
               next
             end
 
+            # Calculate outward hint from the points that are NOT on the axis
+            outward_hint = nil
+            if dist1 >= TOLERANCE
+              closest = closest_point_on_axis(p1, axis_point, axis_vector)
+              outward_hint = (p1 - closest).normalize rescue nil
+            elsif dist2 >= TOLERANCE
+              closest = closest_point_on_axis(p2, axis_point, axis_vector)
+              outward_hint = (p2 - closest).normalize rescue nil
+            end
+
             # Point 1 (and 4) on axis - create single triangle
             if dist1 < TOLERANCE
-              add_triangle_safe(mesh, p1, p2, p3, axis_vector)
+              add_triangle_safe(mesh, p1, p2, p3, axis_vector, outward_hint)
               next
             end
 
             # Point 2 (and 3) on axis - create single triangle
             if dist2 < TOLERANCE
-              add_triangle_safe(mesh, p1, p2, p4, axis_vector)
+              add_triangle_safe(mesh, p1, p2, p4, axis_vector, outward_hint)
               next
             end
 
             # Normal case - create quad as two triangles
-            # Use consistent winding order based on axis direction
-            add_triangle_safe(mesh, p1, p2, p3, axis_vector)
-            add_triangle_safe(mesh, p1, p3, p4, axis_vector)
+            add_triangle_safe(mesh, p1, p2, p3, axis_vector, outward_hint)
+            add_triangle_safe(mesh, p1, p3, p4, axis_vector, outward_hint)
           end
         end
 
@@ -482,7 +517,7 @@ module Dodo
         end
       end
 
-      def add_triangle_safe(mesh, p1, p2, p3, axis_vector)
+      def add_triangle_safe(mesh, p1, p2, p3, axis_vector, outward_hint = nil)
         # Check for degenerate triangle (collinear points or zero area)
         v1 = p2 - p1
         v2 = p3 - p1
@@ -495,7 +530,6 @@ module Dodo
         cross = v1.cross(v2)
         return if cross.length < TOLERANCE
 
-        # Determine winding order - we want normals pointing outward (away from axis)
         # Calculate the centroid of the triangle
         centroid = Geom::Point3d.new(
           (p1.x + p2.x + p3.x) / 3.0,
@@ -504,24 +538,28 @@ module Dodo
         )
 
         # Get the direction from axis to centroid (outward direction)
-        # Project centroid onto axis to find closest point
-        axis_to_centroid = centroid - closest_point_on_axis(centroid, @axis_start, axis_vector)
+        closest_on_axis = closest_point_on_axis(centroid, @axis_start, axis_vector)
+        axis_to_centroid = centroid - closest_on_axis
 
         # Normalize the cross product to get face normal
         normal = cross.normalize
 
-        # Check if normal points outward (same direction as axis_to_centroid)
-        # If dot product is negative, flip the winding
+        # Determine outward direction
         if axis_to_centroid.length > TOLERANCE
-          dot = normal.dot(axis_to_centroid)
-          if dot < 0
-            # Flip winding order
-            mesh.add_polygon(p1, p3, p2)
-          else
-            mesh.add_polygon(p1, p2, p3)
-          end
+          outward_dir = axis_to_centroid.normalize
+        elsif outward_hint
+          outward_dir = outward_hint
         else
-          # Point is on axis, use default winding
+          # Fallback: use the normal itself
+          mesh.add_polygon(p1, p2, p3)
+          return
+        end
+
+        # Check if normal points outward
+        dot = normal.dot(outward_dir)
+        if dot < 0
+          mesh.add_polygon(p1, p3, p2)
+        else
           mesh.add_polygon(p1, p2, p3)
         end
       end
@@ -589,6 +627,97 @@ module Dodo
             end
           end
         end
+      end
+
+      def apply_smart_softening(result_group, axis_point, axis_vector)
+        result_group.entities.grep(Sketchup::Edge).each do |edge|
+          p1 = edge.start.position
+          p2 = edge.end.position
+          edge_vector = p2 - p1
+
+          # Skip degenerate edges
+          next if edge_vector.length < TOLERANCE
+
+          edge_vector.normalize!
+
+          # Calculate how parallel this edge is to the axis
+          # dot product close to 0 means perpendicular (circumferential)
+          # dot product close to 1 means parallel (longitudinal/profile direction)
+          dot = edge_vector.dot(axis_vector).abs
+
+          if dot < 0.5
+            # Circumferential edge (perpendicular to axis) - always soft
+            edge.soft = true
+            edge.smooth = true
+          else
+            # Longitudinal edge (along profile direction)
+            # Check if the original profile edge at this position was soft
+            if profile_edge_was_soft?(p1, p2, axis_point, axis_vector)
+              edge.soft = true
+              edge.smooth = true
+            else
+              edge.soft = false
+              edge.smooth = false
+            end
+          end
+        end
+      end
+
+      def profile_edge_was_soft?(p1, p2, axis_point, axis_vector)
+        # Project both points back to the original profile position (angle = 0)
+        # by finding their positions on the axis and perpendicular distance
+        proj_p1 = project_to_profile_plane(p1, axis_point, axis_vector)
+        proj_p2 = project_to_profile_plane(p2, axis_point, axis_vector)
+
+        # Look up if this segment was soft in the original profile
+        key = edge_segment_key(proj_p1, proj_p2)
+        return @soft_edge_map[key] if @soft_edge_map.key?(key)
+
+        # If exact match not found, try to find a close match
+        @soft_edge_map.each do |stored_key, is_soft|
+          parts = stored_key.split('|')
+          stored_p1 = parse_point_key(parts[0])
+          stored_p2 = parse_point_key(parts[1])
+
+          # Check if this edge matches (in either direction)
+          if (points_close?(proj_p1, stored_p1) && points_close?(proj_p2, stored_p2)) ||
+             (points_close?(proj_p1, stored_p2) && points_close?(proj_p2, stored_p1))
+            return is_soft
+          end
+        end
+
+        false # Default to hard edge if not found
+      end
+
+      def project_to_profile_plane(point, axis_point, axis_vector)
+        # Find the closest point on axis
+        closest = closest_point_on_axis(point, axis_point, axis_vector)
+
+        # Get the perpendicular vector from axis to point
+        perp = point - closest
+        perp_length = perp.length
+
+        return closest if perp_length < TOLERANCE
+
+        # Find the reference perpendicular direction (consistent for all points)
+        ref_perp = find_perpendicular_vector(axis_vector)
+
+        # Calculate the height along axis (distance from axis_point along axis_vector)
+        height = (closest - axis_point).dot(axis_vector)
+
+        # Reconstruct point in the reference plane (angle = 0)
+        result = axis_point.offset(axis_vector, height)
+        result = result.offset(ref_perp, perp_length)
+        result
+      end
+
+      def parse_point_key(key)
+        parts = key.split(',')
+        Geom::Point3d.new(parts[0].to_f, parts[1].to_f, parts[2].to_f)
+      end
+
+      def points_close?(p1, p2, tolerance = 0.01)
+        p1.distance(p2) < tolerance
       end
 
       def copy_materials(source_group, target_group)
