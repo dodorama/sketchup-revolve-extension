@@ -418,6 +418,10 @@ module Dodo
         # Pre-calculate distances to axis for all profile points
         distances = profile_points.map { |pt| distance_to_axis(pt, axis_point, axis_vector) }
 
+        # Determine winding order ONCE based on profile direction and rotation direction
+        # Find a representative point on the profile that is not on the axis
+        flip_winding = calculate_winding_order(profile_points, distances, axis_point, axis_vector, angle_step)
+
         # Generate rotated profile points
         rotated_profiles = []
         num_steps.times do |step|
@@ -455,20 +459,19 @@ module Dodo
 
             # Point 1 (and 4) on axis - create single triangle
             if dist1 < TOLERANCE
-              add_triangle_safe(mesh, p1, p2, p3, axis_vector)
+              add_triangle_safe(mesh, p1, p2, p3, flip_winding)
               next
             end
 
             # Point 2 (and 3) on axis - create single triangle
             if dist2 < TOLERANCE
-              add_triangle_safe(mesh, p1, p2, p4, axis_vector)
+              add_triangle_safe(mesh, p1, p2, p4, flip_winding)
               next
             end
 
             # Normal case - create quad as two triangles
-            # Use consistent winding order based on axis direction
-            add_triangle_safe(mesh, p1, p2, p3, axis_vector)
-            add_triangle_safe(mesh, p1, p3, p4, axis_vector)
+            add_triangle_safe(mesh, p1, p2, p3, flip_winding)
+            add_triangle_safe(mesh, p1, p3, p4, flip_winding)
           end
         end
 
@@ -482,7 +485,68 @@ module Dodo
         end
       end
 
-      def add_triangle_safe(mesh, p1, p2, p3, axis_vector)
+      def calculate_winding_order(profile_points, distances, axis_point, axis_vector, angle_step)
+        # Find a segment of the profile that is away from the axis
+        ref_idx = nil
+        distances.each_with_index do |dist, i|
+          if dist > TOLERANCE && i + 1 < distances.length && distances[i + 1] > TOLERANCE
+            ref_idx = i
+            break
+          end
+        end
+
+        # Fallback: just use first segment
+        ref_idx ||= 0
+        return false if ref_idx + 1 >= profile_points.length
+
+        p1 = profile_points[ref_idx]
+        p2 = profile_points[ref_idx + 1]
+
+        # Profile tangent: direction along the profile
+        profile_tangent = p2 - p1
+        return false if profile_tangent.length < TOLERANCE
+        profile_tangent.normalize!
+
+        # Find radial direction at p1 (from axis to point)
+        closest_on_axis = closest_point_on_axis(p1, axis_point, axis_vector)
+        radial = p1 - closest_on_axis
+
+        # If point is on axis, try p2
+        if radial.length < TOLERANCE
+          closest_on_axis = closest_point_on_axis(p2, axis_point, axis_vector)
+          radial = p2 - closest_on_axis
+          return false if radial.length < TOLERANCE
+        end
+        radial.normalize!
+
+        # Rotation tangent: direction of rotation (perpendicular to axis and radial)
+        # For positive rotation around axis_vector, this is axis_vector × radial
+        rotation_tangent = axis_vector.cross(radial)
+        return false if rotation_tangent.length < TOLERANCE
+        rotation_tangent.normalize!
+
+        # Expected outward normal for a revolved surface: profile_tangent × rotation_tangent
+        expected_normal = profile_tangent.cross(rotation_tangent)
+        return false if expected_normal.length < TOLERANCE
+        expected_normal.normalize!
+
+        # Calculate the actual normal from the triangle winding (p1, p2, p3)
+        # where p3 is p2 rotated by one step
+        rotation = Geom::Transformation.rotation(axis_point, axis_vector, angle_step)
+        p3 = p2.transform(rotation)
+
+        v1 = p2 - p1
+        v2 = p3 - p1
+        actual_normal = v1.cross(v2)
+        return false if actual_normal.length < TOLERANCE
+        actual_normal.normalize!
+
+        # If actual normal is opposite to expected, we need to flip winding
+        dot = actual_normal.dot(expected_normal)
+        dot < 0
+      end
+
+      def add_triangle_safe(mesh, p1, p2, p3, flip_winding)
         # Check for degenerate triangle (collinear points or zero area)
         v1 = p2 - p1
         v2 = p3 - p1
@@ -495,33 +559,10 @@ module Dodo
         cross = v1.cross(v2)
         return if cross.length < TOLERANCE
 
-        # Determine winding order - we want normals pointing outward (away from axis)
-        # Calculate the centroid of the triangle
-        centroid = Geom::Point3d.new(
-          (p1.x + p2.x + p3.x) / 3.0,
-          (p1.y + p2.y + p3.y) / 3.0,
-          (p1.z + p2.z + p3.z) / 3.0
-        )
-
-        # Get the direction from axis to centroid (outward direction)
-        # Project centroid onto axis to find closest point
-        axis_to_centroid = centroid - closest_point_on_axis(centroid, @axis_start, axis_vector)
-
-        # Normalize the cross product to get face normal
-        normal = cross.normalize
-
-        # Check if normal points outward (same direction as axis_to_centroid)
-        # If dot product is negative, flip the winding
-        if axis_to_centroid.length > TOLERANCE
-          dot = normal.dot(axis_to_centroid)
-          if dot < 0
-            # Flip winding order
-            mesh.add_polygon(p1, p3, p2)
-          else
-            mesh.add_polygon(p1, p2, p3)
-          end
+        # Use pre-calculated winding order
+        if flip_winding
+          mesh.add_polygon(p1, p3, p2)
         else
-          # Point is on axis, use default winding
           mesh.add_polygon(p1, p2, p3)
         end
       end
