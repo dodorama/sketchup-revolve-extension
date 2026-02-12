@@ -227,6 +227,9 @@ module Dodo
           axis_vector = @axis_end - @axis_start
           axis_vector.normalize!
 
+          # Find corner distances (where profile edges meet at an angle)
+          corner_distances = find_corner_distances(profile_chains, axis_point, axis_vector)
+
           # Create polygon mesh for the revolved surface
           mesh = create_revolve_mesh(profile_chains, axis_point, axis_vector, @angle, @segments)
 
@@ -240,8 +243,8 @@ module Dodo
           result_group = model.active_entities.add_group
           result_group.entities.fill_from_mesh(mesh, true, Geom::PolygonMesh::NO_SMOOTH_OR_HIDE)
 
-          # Soften only rotation edges (not profile edges)
-          soften_rotation_edges(result_group, axis_point, axis_vector)
+          # Soften all edges except rotation edges at corner distances
+          smart_soften_edges(result_group, axis_point, axis_vector, corner_distances)
 
           # Copy materials if available
           copy_materials(@profile_group, result_group)
@@ -649,17 +652,73 @@ module Dodo
         end
       end
 
-      def soften_rotation_edges(result_group, axis_point, axis_vector)
-        # Soften edges that are tangent to the rotation (rotation edges)
-        # Keep edges along the profile direction hard (profile edges)
-        #
-        # A rotation edge is parallel to the rotation tangent (axis × radial)
-        # A profile edge follows the original profile shape
+      def find_corner_distances(profile_chains, axis_point, axis_vector)
+        # Find distances from axis for profile vertices where edges meet at an angle
+        # These are the "corners" that should create visible rings when revolved
+        corner_distances = []
+        angle_threshold = 15.degrees  # Angles sharper than this are considered corners
+
+        profile_chains.each do |profile_points|
+          next if profile_points.length < 3
+
+          (0...profile_points.length).each do |i|
+            # Get three consecutive points
+            prev_idx = (i - 1) % profile_points.length
+            next_idx = (i + 1) % profile_points.length
+
+            # Skip if we're at endpoints of an open profile
+            is_closed = profile_points.first.distance(profile_points.last) < TOLERANCE
+            if !is_closed
+              next if i == 0 || i == profile_points.length - 1
+            end
+
+            p_prev = profile_points[prev_idx]
+            p_curr = profile_points[i]
+            p_next = profile_points[next_idx]
+
+            # Calculate vectors
+            v1 = p_prev - p_curr
+            v2 = p_next - p_curr
+
+            next if v1.length < TOLERANCE || v2.length < TOLERANCE
+
+            v1.normalize!
+            v2.normalize!
+
+            # Calculate angle between edges
+            dot = v1.dot(v2)
+            dot = [[-1.0, dot].max, 1.0].min  # Clamp for numerical stability
+            angle = Math.acos(dot)
+
+            # If angle is sharp enough, this is a corner
+            # (angle is the angle at the vertex, so 180° = straight, smaller = sharper)
+            if angle < (Math::PI - angle_threshold)
+              dist = distance_to_axis(p_curr, axis_point, axis_vector)
+              corner_distances << dist if dist > TOLERANCE
+            end
+          end
+
+          # Also add first and last points of open profiles as corners
+          is_closed = profile_points.first.distance(profile_points.last) < TOLERANCE
+          unless is_closed
+            dist_first = distance_to_axis(profile_points.first, axis_point, axis_vector)
+            dist_last = distance_to_axis(profile_points.last, axis_point, axis_vector)
+            corner_distances << dist_first if dist_first > TOLERANCE
+            corner_distances << dist_last if dist_last > TOLERANCE
+          end
+        end
+
+        corner_distances.uniq
+      end
+
+      def smart_soften_edges(result_group, axis_point, axis_vector, corner_distances)
+        # Soften all edges EXCEPT rotation edges at corner distances
+        # Corner distances are where profile edges meet at an angle
 
         result_group.entities.each do |entity|
           next unless entity.is_a?(Sketchup::Edge)
 
-          # Get edge midpoint and direction
+          # Get edge endpoints and midpoint
           p1 = entity.start.position
           p2 = entity.end.position
           midpoint = Geom::Point3d.linear_combination(0.5, p1, 0.5, p2)
@@ -668,30 +727,26 @@ module Dodo
           next if edge_vector.length < TOLERANCE
           edge_vector.normalize!
 
-          # Calculate radial direction at edge midpoint (from axis to midpoint)
-          closest_on_axis = closest_point_on_axis(midpoint, axis_point, axis_vector)
-          radial = midpoint - closest_on_axis
+          # Calculate distances from axis
+          dist1 = distance_to_axis(p1, axis_point, axis_vector)
+          dist2 = distance_to_axis(p2, axis_point, axis_vector)
+          dist_mid = distance_to_axis(midpoint, axis_point, axis_vector)
 
-          # Skip edges on the axis (e.g., at poles of revolution)
-          if radial.length < TOLERANCE
-            # Edge is on the axis - this is a profile edge, keep hard
-            next
+          # Check if this is a rotation edge (both endpoints at same distance from axis)
+          is_rotation_edge = (dist1 - dist2).abs < TOLERANCE * 10
+
+          # Check if edge is at a corner distance
+          is_at_corner = corner_distances.any? do |corner_dist|
+            (dist_mid - corner_dist).abs < TOLERANCE * 10
           end
-          radial.normalize!
 
-          # Rotation tangent direction: perpendicular to both axis and radial
-          # This is the direction of circular motion around the axis
-          rotation_tangent = axis_vector.cross(radial)
-          next if rotation_tangent.length < TOLERANCE
-          rotation_tangent.normalize!
-
-          # A rotation edge is parallel to the rotation tangent
-          # Check how aligned the edge is with the rotation tangent
-          dot_tangent = edge_vector.dot(rotation_tangent).abs
-
-          # If edge is nearly parallel to rotation tangent (dot close to 1),
-          # it's a rotation edge and should be softened
-          if dot_tangent > 0.7  # ~45 degrees or less from tangent = rotation edge
+          # Only keep hard if it's a rotation edge at a corner distance
+          if is_rotation_edge && is_at_corner
+            # Keep hard - this is a visible corner ring
+            entity.soft = false
+            entity.smooth = false
+          else
+            # Soften everything else
             entity.soft = true
             entity.smooth = true
           end
