@@ -653,8 +653,8 @@ module Dodo
         # Soften edges that are tangent to the rotation (rotation edges)
         # Keep edges along the profile direction hard (profile edges)
         #
-        # A rotation edge is perpendicular to the radial direction
-        # (from axis to edge midpoint) - it follows the circular path of rotation
+        # A rotation edge is parallel to the rotation tangent (axis × radial)
+        # A profile edge follows the original profile shape
 
         result_group.entities.each do |entity|
           next unless entity.is_a?(Sketchup::Edge)
@@ -679,13 +679,19 @@ module Dodo
           end
           radial.normalize!
 
-          # A rotation edge is perpendicular to the radial direction
-          # (it follows the circular arc around the axis)
-          dot_radial = edge_vector.dot(radial).abs
+          # Rotation tangent direction: perpendicular to both axis and radial
+          # This is the direction of circular motion around the axis
+          rotation_tangent = axis_vector.cross(radial)
+          next if rotation_tangent.length < TOLERANCE
+          rotation_tangent.normalize!
 
-          # Threshold: if nearly perpendicular to radial (dot product close to 0),
+          # A rotation edge is parallel to the rotation tangent
+          # Check how aligned the edge is with the rotation tangent
+          dot_tangent = edge_vector.dot(rotation_tangent).abs
+
+          # If edge is nearly parallel to rotation tangent (dot close to 1),
           # it's a rotation edge and should be softened
-          if dot_radial < 0.3  # ~73 degrees or more from radial = rotation edge
+          if dot_tangent > 0.7  # ~45 degrees or less from tangent = rotation edge
             entity.soft = true
             entity.smooth = true
           end
