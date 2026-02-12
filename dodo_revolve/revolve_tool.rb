@@ -502,33 +502,22 @@ module Dodo
         p1 = profile_points[ref_idx]
         p2 = profile_points[ref_idx + 1]
 
-        # Profile tangent: direction along the profile
-        profile_tangent = p2 - p1
-        return false if profile_tangent.length < TOLERANCE
-        profile_tangent.normalize!
+        # Find radial direction at the midpoint of this segment (from axis outward)
+        midpoint = Geom::Point3d.linear_combination(0.5, p1, 0.5, p2)
+        closest_on_axis = closest_point_on_axis(midpoint, axis_point, axis_vector)
+        radial = midpoint - closest_on_axis
 
-        # Find radial direction at p1 (from axis to point)
-        closest_on_axis = closest_point_on_axis(p1, axis_point, axis_vector)
-        radial = p1 - closest_on_axis
-
-        # If point is on axis, try p2
+        # If midpoint is on axis, try p1 or p2
+        if radial.length < TOLERANCE
+          closest_on_axis = closest_point_on_axis(p1, axis_point, axis_vector)
+          radial = p1 - closest_on_axis
+        end
         if radial.length < TOLERANCE
           closest_on_axis = closest_point_on_axis(p2, axis_point, axis_vector)
           radial = p2 - closest_on_axis
           return false if radial.length < TOLERANCE
         end
         radial.normalize!
-
-        # Rotation tangent: direction of rotation (perpendicular to axis and radial)
-        # For positive rotation around axis_vector, this is axis_vector × radial
-        rotation_tangent = axis_vector.cross(radial)
-        return false if rotation_tangent.length < TOLERANCE
-        rotation_tangent.normalize!
-
-        # Expected outward normal for a revolved surface: profile_tangent × rotation_tangent
-        expected_normal = profile_tangent.cross(rotation_tangent)
-        return false if expected_normal.length < TOLERANCE
-        expected_normal.normalize!
 
         # Calculate the actual normal from the triangle winding (p1, p2, p3)
         # where p3 is p2 rotated by one step
@@ -541,8 +530,9 @@ module Dodo
         return false if actual_normal.length < TOLERANCE
         actual_normal.normalize!
 
-        # If actual normal is opposite to expected, we need to flip winding
-        dot = actual_normal.dot(expected_normal)
+        # We want faces pointing OUTWARD (away from axis)
+        # If actual normal points inward (negative dot with radial), flip winding
+        dot = actual_normal.dot(radial)
         dot < 0
       end
 
