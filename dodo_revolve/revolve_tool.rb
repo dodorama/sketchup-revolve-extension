@@ -238,7 +238,10 @@ module Dodo
 
           # Create a new group for the result
           result_group = model.active_entities.add_group
-          result_group.entities.fill_from_mesh(mesh, true, Geom::PolygonMesh::AUTO_SOFTEN)
+          result_group.entities.fill_from_mesh(mesh, true, Geom::PolygonMesh::NO_SMOOTH_OR_HIDE)
+
+          # Soften only rotation edges (not profile edges)
+          soften_rotation_edges(result_group, axis_point, axis_vector)
 
           # Copy materials if available
           copy_materials(@profile_group, result_group)
@@ -642,6 +645,49 @@ module Dodo
             if entity.is_a?(Sketchup::Face)
               entity.material = source_material
             end
+          end
+        end
+      end
+
+      def soften_rotation_edges(result_group, axis_point, axis_vector)
+        # Soften edges that are tangent to the rotation (rotation edges)
+        # Keep edges along the profile direction hard (profile edges)
+        #
+        # A rotation edge is perpendicular to the radial direction
+        # (from axis to edge midpoint) - it follows the circular path of rotation
+
+        result_group.entities.each do |entity|
+          next unless entity.is_a?(Sketchup::Edge)
+
+          # Get edge midpoint and direction
+          p1 = entity.start.position
+          p2 = entity.end.position
+          midpoint = Geom::Point3d.linear_combination(0.5, p1, 0.5, p2)
+
+          edge_vector = p2 - p1
+          next if edge_vector.length < TOLERANCE
+          edge_vector.normalize!
+
+          # Calculate radial direction at edge midpoint (from axis to midpoint)
+          closest_on_axis = closest_point_on_axis(midpoint, axis_point, axis_vector)
+          radial = midpoint - closest_on_axis
+
+          # Skip edges on the axis (e.g., at poles of revolution)
+          if radial.length < TOLERANCE
+            # Edge is on the axis - this is a profile edge, keep hard
+            next
+          end
+          radial.normalize!
+
+          # A rotation edge is perpendicular to the radial direction
+          # (it follows the circular arc around the axis)
+          dot_radial = edge_vector.dot(radial).abs
+
+          # Threshold: if nearly perpendicular to radial (dot product close to 0),
+          # it's a rotation edge and should be softened
+          if dot_radial < 0.3  # ~73 degrees or more from radial = rotation edge
+            entity.soft = true
+            entity.smooth = true
           end
         end
       end
