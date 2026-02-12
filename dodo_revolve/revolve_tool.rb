@@ -475,9 +475,8 @@ module Dodo
               next
             end
 
-            # Normal case - create quad as two triangles
-            add_triangle_safe(mesh, p1, p2, p3, flip_winding)
-            add_triangle_safe(mesh, p1, p3, p4, flip_winding)
+            # Normal case - use quad if coplanar, otherwise triangulate
+            add_quad_or_triangles(mesh, p1, p2, p3, p4, flip_winding)
           end
         end
 
@@ -560,6 +559,43 @@ module Dodo
           mesh.add_polygon(p1, p3, p2)
         else
           mesh.add_polygon(p1, p2, p3)
+        end
+      end
+
+      def add_quad_or_triangles(mesh, p1, p2, p3, p4, flip_winding)
+        # Check if the 4 points are coplanar enough for a quad
+        # If coplanar, use a single quad face; otherwise use two triangles
+
+        # Coplanarity check: compute normal from first 3 points,
+        # then check if 4th point lies on that plane
+        v1 = p2 - p1
+        v2 = p3 - p1
+        v3 = p4 - p1
+
+        return if v1.length < TOLERANCE || v2.length < TOLERANCE || v3.length < TOLERANCE
+
+        normal = v1.cross(v2)
+        return if normal.length < TOLERANCE
+
+        # Distance from p4 to the plane defined by p1, p2, p3
+        normal.normalize!
+        plane_distance = v3.dot(normal).abs
+
+        # Tolerance for coplanarity (relative to quad size)
+        quad_diagonal = [p1.distance(p3), p2.distance(p4)].max
+        coplanar_tolerance = quad_diagonal * 0.01  # 1% of diagonal
+
+        if plane_distance < coplanar_tolerance
+          # Points are coplanar - use a quad
+          if flip_winding
+            mesh.add_polygon(p1, p4, p3, p2)
+          else
+            mesh.add_polygon(p1, p2, p3, p4)
+          end
+        else
+          # Not coplanar - use two triangles
+          add_triangle_safe(mesh, p1, p2, p3, flip_winding)
+          add_triangle_safe(mesh, p1, p3, p4, flip_winding)
         end
       end
 
